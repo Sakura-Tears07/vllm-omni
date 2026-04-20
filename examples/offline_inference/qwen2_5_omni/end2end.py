@@ -289,8 +289,8 @@ query_map = {
 
 
 def main(args):
-    model_name = "Qwen/Qwen2.5-Omni-7B"
-
+    #model_name = "Qwen/Qwen2.5-Omni-7B"
+    model_name = "/home/haoranli/models/Qwen2.5-Omni-3B"
     # Get paths from args
     video_path = getattr(args, "video_path", None)
     image_path = getattr(args, "image_path", None)

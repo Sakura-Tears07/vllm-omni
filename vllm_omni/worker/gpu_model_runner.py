@@ -1,3 +1,6 @@
+from contextlib import nullcontext
+from copy import copy
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -5,7 +8,7 @@ import torch
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CUDAGraphMode
 from vllm.distributed.parallel_state import get_pp_group
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import get_forward_context, override_forward_context, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import supports_mrope
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
@@ -17,6 +20,7 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
+from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
@@ -1361,6 +1365,63 @@ class OmniGPUModelRunner(GPUModelRunner):
             update_dict = {out_key: code_predictor_codes[idx : idx + 1]}
             self._merge_additional_information_update(req_id, update_dict)
 
+    def _fa3_nullify_scheduler_metadata_cm(self):
+        """Clear FA3 ``scheduler_metadata`` on attention layers for this forward.
+
+        On some setups (e.g. Hopper + FA3) ``get_scheduler_metadata`` and
+        ``_vllm_fa3_C.fwd`` disagree on buffer size, raising
+        ``RuntimeError: scheduler_metadata must have shape (metadata_size)``.
+        Passing ``None`` uses the kernel default scheduler (~small perf cost),
+        matching the workaround in ``voxcpm2_talker._nullify_volatile_metadata``.
+        """
+        if get_flash_attn_version() != 3:
+            return nullcontext()
+        try:
+            ctx = get_forward_context()
+        except AssertionError:
+            return nullcontext()
+        am = ctx.attn_metadata
+        if am is None:
+            return nullcontext()
+
+        def _strip_one(meta_dict: dict) -> tuple[dict, bool]:
+            out: dict = {}
+            changed = False
+            for layer_name, meta in meta_dict.items():
+                if getattr(meta, "scheduler_metadata", None) is not None:
+                    meta = copy(meta)
+                    meta.scheduler_metadata = None
+                    changed = True
+                out[layer_name] = meta
+            return out, changed
+
+        if isinstance(am, dict):
+            new_am, changed = _strip_one(am)
+            if not changed:
+                return nullcontext()
+            logger.warning_once(
+                "FA3: clearing scheduler_metadata for this forward "
+                "(workaround for metadata_size mismatch). "
+                "Override with attention_config.flash_attn_version=2 if undesired."
+            )
+            return override_forward_context(replace(ctx, attn_metadata=new_am))
+        if isinstance(am, list):
+            new_list = []
+            any_changed = False
+            for d in am:
+                new_d, ch = _strip_one(d)
+                new_list.append(new_d)
+                any_changed = any_changed or ch
+            if not any_changed:
+                return nullcontext()
+            logger.warning_once(
+                "FA3: clearing scheduler_metadata for this forward "
+                "(workaround for metadata_size mismatch). "
+                "Override with attention_config.flash_attn_version=2 if undesired."
+            )
+            return override_forward_context(replace(ctx, attn_metadata=new_list))
+        return nullcontext()
+
     def _model_forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -1372,14 +1433,15 @@ class OmniGPUModelRunner(GPUModelRunner):
         """Inject omni-specific kwargs into forward and cache model output"""
         model_kwargs_extra = self._build_model_kwargs_extra()
 
-        model_output = super()._model_forward(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **model_kwargs,
-            **model_kwargs_extra,
-        )
+        with self._fa3_nullify_scheduler_metadata_cm():
+            model_output = super()._model_forward(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+                **model_kwargs_extra,
+            )
         if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
             model_output = self.model.make_omni_output(model_output, **model_kwargs, **model_kwargs_extra)
         # Cache model output so later sample_tokens can consume multimodal results.
