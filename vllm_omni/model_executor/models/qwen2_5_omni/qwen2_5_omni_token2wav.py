@@ -35,6 +35,10 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.qwen2_5_omni.audio_length import cap_and_align_mel_length, resolve_max_mel_frames
+from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_magi import (
+    Qwen2OmniDiTTransformerStack,
+    is_magi_compiler_enabled,
+)
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -1200,6 +1204,12 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
                     look_backward_block=1 if i in config.look_backward_layers else 0,
                 )
             )
+        self._dit_transformer_stack = Qwen2OmniDiTTransformerStack(self.transformer_blocks)
+        if is_magi_compiler_enabled():
+            logger.info(
+                "VLLM_OMNI_MAGI_COMPILER is set: Token2Wav DiT stack is decorated with "
+                "magi_compile (install magi_compiler for acceleration)."
+            )
 
         self.norm_out = Qwen2_5_OmniAdaLayerNormZero_Final(config.hidden_size)  # final modulation
         self.proj_out = nn.Linear(config.hidden_size, config.mel_dim)
@@ -1248,14 +1258,14 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         position_embeddings = self.rotary_embed(hidden_states)
         blockwise_difference = self._create_block_diff(hidden_states)
 
-        # Transformer blocks
-        for transformer_block in self.transformer_blocks:
-            hidden_states = transformer_block(
-                hidden_states,
-                time_embedding,
-                position_embeddings=position_embeddings,
-                block_diff=blockwise_difference,
-            )
+        cos, sin = position_embeddings
+        hidden_states = self._dit_transformer_stack(
+            hidden_states,
+            time_embedding,
+            cos,
+            sin,
+            blockwise_difference,
+        )
 
         hidden_states = self.norm_out(hidden_states, time_embedding)
         output = self.proj_out(hidden_states)

@@ -5,6 +5,7 @@ This example shows how to use vLLM-Omni for running offline inference
 with the correct prompt format on Qwen2.5-Omni
 """
 
+import json
 import os
 import time
 from typing import NamedTuple
@@ -532,6 +533,17 @@ def parse_args():
         action="store_true",
         default=False,
         help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
+    )
+    parser.add_argument(
+        "--code2wav-compilation-config",
+        dest="stage_2_compilation_config",
+        type=json.loads,
+        default=None,
+        help=(
+            "JSON object for stage 2 (code2wav) engine ``compilation_config`` "
+            "(merged into that stage only). When ``VLLM_OMNI_MAGI_COMPILER=1``, "
+            "vLLM compile is auto-disabled for code2wav to avoid conflicting with MagiCompiler."
+        ),
     )
     return parser.parse_args()
 
