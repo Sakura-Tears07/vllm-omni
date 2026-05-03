@@ -36,7 +36,7 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.qwen2_5_omni.audio_length import cap_and_align_mel_length, resolve_max_mel_frames
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_magi import (
-    Qwen2OmniDiTTransformerStack,
+    apply_magi_to_decoder_layers,
     is_magi_compiler_enabled,
 )
 from vllm_omni.platforms import current_omni_platform
@@ -1204,11 +1204,11 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
                     look_backward_block=1 if i in config.look_backward_layers else 0,
                 )
             )
-        self._dit_transformer_stack = Qwen2OmniDiTTransformerStack(self.transformer_blocks)
+        self._dit_transformer_stack = apply_magi_to_decoder_layers(self.transformer_blocks)
         if is_magi_compiler_enabled():
             logger.info(
-                "VLLM_OMNI_MAGI_COMPILER is set: Token2Wav DiT stack is decorated with "
-                "magi_compile (install magi_compiler for acceleration)."
+                "VLLM_OMNI_MAGI_COMPILER is set: Token2Wav DiT uses "
+                "apply_magi_to_decoder_layers (install magi_compiler for acceleration)."
             )
 
         self.norm_out = Qwen2_5_OmniAdaLayerNormZero_Final(config.hidden_size)  # final modulation

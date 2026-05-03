@@ -557,7 +557,8 @@ def parse_args():
         help=(
             "JSON object for stage 2 (code2wav) engine ``compilation_config`` "
             "(merged into that stage only). When ``VLLM_OMNI_MAGI_COMPILER=1``, "
-            "vLLM compile is auto-disabled for code2wav to avoid conflicting with MagiCompiler."
+            "vLLM compile is auto-disabled on code2wav so ``apply_magi_to_decoder_layers`` "
+            "(MagiCompiler) can own the DiT stack."
         ),
     )
     return parser.parse_args(), parser

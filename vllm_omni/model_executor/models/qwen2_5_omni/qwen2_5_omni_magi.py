@@ -1,9 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Optional MagiCompiler integration for Qwen2.5-Omni Token2Wav DiT.
 
-Set ``VLLM_OMNI_MAGI_COMPILER=1`` and install `MagiCompiler` (see SandAI-org/MagiCompiler)
-to compile the DiT transformer stack. If MagiCompiler is not installed, decorators fall
-back to no-ops (same behaviour as ``magi_human_dit``).
+Integration surface (intended usage):
+
+1. **Example entrypoint**: ``examples/offline_inference/qwen2_5_omni/magi_example.py``
+2. **Model wiring**: ``apply_magi_to_decoder_layers(transformer_blocks)`` from
+   ``qwen2_5_omni_token2wav`` (single call site on the DiT model).
+3. **Definition**: :func:`apply_magi_to_decoder_layers` and the decorated stack
+   class in this module.
+
+Set ``VLLM_OMNI_MAGI_COMPILER=1`` and install `MagiCompiler` (SandAI-org/MagiCompiler).
+If it is not installed, ``magi_compile`` is a no-op (same pattern as ``magi_human_dit``).
+
+Engine startup still calls :func:`merge_vllm_compilation_config_for_magi` from
+``stage_init_utils`` so vLLM's compile stack stays off on the code2wav stage when Magi
+is enabled (implementation detail, not part of the three-part API above).
 """
 
 from __future__ import annotations
@@ -118,14 +129,13 @@ def merge_vllm_compilation_config_for_magi(engine_args_dict: dict[str, Any]) -> 
         "block_diff": [2, 3],
     },
 )
-class Qwen2OmniDiTTransformerStack(nn.Module):
-    """Runs ``DiTDecoderLayer`` blocks; subject to MagiCompiler when enabled."""
+class _Qwen2OmniDiTTransformerStack(nn.Module):
+    """Runs ``DiTDecoderLayer`` blocks; compiled via ``magi_compile`` when enabled."""
 
     def __init__(self, blocks: nn.ModuleList):
         super().__init__()
         # Shares the same ModuleList instance as ``Qwen2_5OmniToken2WavDiTModel.transformer_blocks``.
         self.blocks = blocks
-    
 
     def forward(
         self,
@@ -144,3 +154,20 @@ class Qwen2OmniDiTTransformerStack(nn.Module):
                 block_diff=block_diff,
             )
         return hidden_states
+
+
+def apply_magi_to_decoder_layers(blocks: nn.ModuleList) -> nn.Module:
+    """Wrap Token2Wav DiT decoder layers for optional MagiCompiler compilation.
+
+    When ``VLLM_OMNI_MAGI_COMPILER`` is enabled and ``magi_compiler`` is installed,
+    the returned module's forward is compiled with ``magi_compile``. Otherwise behaviour
+    matches an eager loop over the same ``blocks``.
+
+    Args:
+        blocks: ``Qwen2_5OmniToken2WavDiTModel.transformer_blocks`` (shared reference).
+
+    Returns:
+        A module whose ``forward(hidden_states, time_embedding, cos, sin, block_diff)``
+        runs all decoder layers.
+    """
+    return _Qwen2OmniDiTTransformerStack(blocks)
