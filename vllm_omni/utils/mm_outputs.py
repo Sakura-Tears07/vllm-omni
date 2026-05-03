@@ -8,7 +8,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
+def build_mm_cpu(multimodal_outputs: dict | None) -> dict[str, object]:
     """Pre-copies multimodal tensor to CPU once (not per-request) to avoid
     redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.
 
@@ -21,10 +21,14 @@ def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
     # Pre-copy multimodal tensors to CPU once (not per-request) to avoid
     # redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.
     mm_cpu: dict[str, object] = {}
-    # Currently there are some cases where this is true at the
-    # moment, which should be fixed.
+    if multimodal_outputs is None:
+        return mm_cpu
     if not isinstance(multimodal_outputs, dict):
-        logger.warning("Multimodal outputs are not a dict and will not be passed")
+        logger.warning_once(
+            "Multimodal outputs are not a dict (type=%s); skipping CPU multimodal staging",
+            type(multimodal_outputs),
+        )
+        return mm_cpu
 
     if multimodal_outputs:
         for k, v in multimodal_outputs.items():
