@@ -6,7 +6,7 @@ Integration surface (intended usage):
 1. **Example entrypoint**: ``examples/offline_inference/qwen2_5_omni/magi_example.py``
 2. **Model wiring**: ``apply_magi_to_decoder_layers(transformer_blocks)`` from
    ``qwen2_5_omni_token2wav`` (single call site on the DiT model).
-3. **Definition**: :func:`apply_magi_to_decoder_layers` and the decorated stack
+3. **Definition**: :func:`apply_magi_to_decoder_layers` and the stack module
    class in this module.
 
 Set ``VLLM_OMNI_MAGI_COMPILER=1`` and install `MagiCompiler` (SandAI-org/MagiCompiler).
@@ -32,15 +32,22 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+_HAS_MAGI_COMPILER = True
 try:
-    from magi_compiler.api import magi_compile as _magi_compile
-except Exception:  # pragma: no cover - optional dependency
+    # Preferred import path in most MagiCompiler examples.
+    from magi_compiler import magi_compile as _magi_compile
+except Exception:
+    try:
+        # Backward-compatible path used by some versions.
+        from magi_compiler.api import magi_compile as _magi_compile
+    except Exception:  # pragma: no cover - optional dependency
+        _HAS_MAGI_COMPILER = False
 
-    def _magi_compile(*args, **kwargs):
-        def decorator(cls_or_fn):
-            return cls_or_fn
+        def _magi_compile(*args, **kwargs):
+            def decorator(cls_or_fn):
+                return cls_or_fn
 
-        return decorator
+            return decorator
 
 
 def is_magi_compiler_enabled() -> bool:
@@ -50,6 +57,14 @@ def is_magi_compiler_enabled() -> bool:
         "yes",
         "on",
     )
+
+
+def _warn_if_magi_requested_but_unavailable() -> None:
+    if is_magi_compiler_enabled() and not _HAS_MAGI_COMPILER:
+        logger.warning(
+            "[MagiCompiler] VLLM_OMNI_MAGI_COMPILER is enabled but magi_compiler "
+            "cannot be imported. The decorator is a no-op and no Magi fusion will happen."
+        )
 
 
 # Align with LightX2V-MagiCompiler practice: use MagiCompiler as the single
@@ -92,7 +107,10 @@ def merge_vllm_compilation_config_for_magi(engine_args_dict: dict[str, Any]) -> 
     """
     if not is_magi_compiler_enabled():
         return
-    if engine_args_dict.get("model_arch") != "Qwen2_5OmniForConditionalGeneration":
+    model_arch = engine_args_dict.get("model_arch")
+    # Some stage-config paths do not populate model_arch. Only reject when an
+    # explicit non-Qwen2.5 architecture is present.
+    if model_arch is not None and model_arch != "Qwen2_5OmniForConditionalGeneration":
         return
     if engine_args_dict.get("model_stage") != "code2wav":
         return
@@ -113,22 +131,6 @@ def merge_vllm_compilation_config_for_magi(engine_args_dict: dict[str, Any]) -> 
     )
 
 
-@_magi_compile(
-    enable_if=is_magi_compiler_enabled,
-    model_tag="qwen2_5_omni_token2wav_dit",
-    dynamic_arg_dims={
-        # [batch, seq, hidden] — seq varies across requests/steps
-        "hidden_states": 1,
-        "time_embedding": 0,
-        "cos": 1,
-        "sin": 1,
-        # [batch, heads, seq, seq] from ``_create_block_diff`` — only mark the
-        # attention map spatial dims (2, 3) as dynamic.  Do not mark dim 0:
-        # Dynamo/SDPA specialize batch to the warmup size (e.g. 2) and
-        # ``mark_dynamic`` on dim 0 then fails with ConstraintViolationError.
-        "block_diff": [2, 3],
-    },
-)
 class _Qwen2OmniDiTTransformerStack(nn.Module):
     """Runs ``DiTDecoderLayer`` blocks; compiled via ``magi_compile`` when enabled."""
 
@@ -156,6 +158,19 @@ class _Qwen2OmniDiTTransformerStack(nn.Module):
         return hidden_states
 
 
+_MAGI_DYNAMIC_ARG_DIMS: dict[str, int | list[int]] = {
+    # [batch, seq, hidden] — seq varies across requests/steps
+    "hidden_states": 1,
+    "cos": 1,
+    "sin": 1,
+    # [batch, heads, seq, seq] from ``_create_block_diff`` — only mark the
+    # attention map spatial dims (2, 3) as dynamic. Do not mark dim 0:
+    # Dynamo/SDPA specialize batch to the warmup size (e.g. 2) and
+    # ``mark_dynamic`` on dim 0 then fails with ConstraintViolationError.
+    "block_diff": [2, 3],
+}
+
+
 def apply_magi_to_decoder_layers(blocks: nn.ModuleList) -> nn.Module:
     """Wrap Token2Wav DiT decoder layers for optional MagiCompiler compilation.
 
@@ -170,4 +185,24 @@ def apply_magi_to_decoder_layers(blocks: nn.ModuleList) -> nn.Module:
         A module whose ``forward(hidden_states, time_embedding, cos, sin, block_diff)``
         runs all decoder layers.
     """
-    return _Qwen2OmniDiTTransformerStack(blocks)
+    stack = _Qwen2OmniDiTTransformerStack(blocks)
+    _warn_if_magi_requested_but_unavailable()
+    if not is_magi_compiler_enabled():
+        return stack
+    if not _HAS_MAGI_COMPILER:
+        return stack
+
+    try:
+        compiled_stack = _magi_compile(
+            stack,
+            model_tag="qwen2_5_omni_token2wav_dit",
+            dynamic_arg_dims=_MAGI_DYNAMIC_ARG_DIMS,
+        )
+        logger.info("[MagiCompiler] Compiled Token2Wav DiT transformer stack via magi_compile.")
+        return compiled_stack
+    except Exception as exc:
+        logger.warning(
+            "[MagiCompiler] Failed to compile Token2Wav DiT stack, fallback to eager stack: %s",
+            exc,
+        )
+        return stack
