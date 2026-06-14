@@ -33,6 +33,7 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_magi import (
     apply_magi_to_qwen2_decoder_layers,
+    apply_magi_to_talker_logits_stack,
     is_magi_compiler_enabled,
 )
 
@@ -298,7 +299,8 @@ class Qwen2Model(nn.Module):
         if is_magi_compiler_enabled():
             logger.info(
                 "VLLM_OMNI_MAGI_COMPILER is set: talker Qwen2 uses "
-                "apply_magi_to_qwen2_decoder_layers (install magi_compiler for acceleration)."
+                "apply_magi_to_qwen2_decoder_layers and apply_magi_to_talker_logits_stack "
+                "(install magi_compiler for acceleration)."
             )
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -427,6 +429,13 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = Sampler()
+        if get_pp_group().is_last_rank:
+            self._talker_logits_stack = apply_magi_to_talker_logits_stack(
+                self.lm_head,
+                self.logits_processor,
+            )
+        else:
+            self._talker_logits_stack = None
 
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
@@ -447,8 +456,12 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        return logits
+        # MagiCompiler cannot mark dim 0 dynamic when batch/token count is 0 or 1
+        # (Dynamo zero/one specialization). vLLM profile_run with max_num_seqs=1
+        # passes [1, hidden] here; keep that path eager and compile only when >= 2.
+        if self._talker_logits_stack is not None and hidden_states.shape[0] > 1:
+            return self._talker_logits_stack(hidden_states)
+        return self.logits_processor(self.lm_head, hidden_states)
 
     def sample(
         self,

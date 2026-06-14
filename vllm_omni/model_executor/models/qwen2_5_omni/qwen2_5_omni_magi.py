@@ -5,7 +5,8 @@ Integration surface (intended usage):
 
 1. **Example entrypoint**: ``examples/offline_inference/qwen2_5_omni/magi_example.py``
 2. **Model wiring**:
-   - Stage1 talker: ``apply_magi_to_qwen2_decoder_layers`` from ``qwen2_old.Qwen2Model``
+   - Stage1 talker: ``apply_magi_to_qwen2_decoder_layers`` from ``qwen2_old.Qwen2Model``;
+     ``apply_magi_to_talker_logits_stack`` from ``qwen2_old.Qwen2ForCausalLM``
    - Stage2 code2wav: ``apply_magi_to_decoder_layers`` from ``qwen2_5_omni_token2wav``
 3. **Definition**: stack modules and apply helpers in this module.
 
@@ -205,6 +206,24 @@ _MAGI_TALKER_DYNAMIC_ARG_DIMS: dict[str, int | list[int]] = {
     "positions": -1,
 }
 
+_MAGI_TALKER_LOGITS_DYNAMIC_ARG_DIMS: dict[str, int | list[int]] = {
+    # Flattened token layout [num_tokens, hidden] — num_tokens varies per decode step.
+    # Callers must skip Magi when shape[0] <= 1 (see Qwen2ForCausalLM.compute_logits).
+    "hidden_states": 0,
+}
+
+
+class _Qwen2OmniTalkerLogitsStack(nn.Module):
+    """Talker lm_head path: ``LogitsProcessor(lm_head, hidden_states)``."""
+
+    def __init__(self, lm_head: nn.Module, logits_processor: nn.Module):
+        super().__init__()
+        self.lm_head = lm_head
+        self.logits_processor = logits_processor
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        return self.logits_processor(self.lm_head, hidden_states)
+
 
 def apply_magi_to_qwen2_decoder_layers(
     layers: nn.ModuleList,
@@ -230,6 +249,34 @@ def apply_magi_to_qwen2_decoder_layers(
     except Exception as exc:
         logger.warning(
             "[MagiCompiler] Failed to compile talker decoder stack, fallback to eager stack: %s",
+            exc,
+        )
+        return stack
+
+
+def apply_magi_to_talker_logits_stack(
+    lm_head: nn.Module,
+    logits_processor: nn.Module,
+) -> nn.Module:
+    """Wrap talker ``lm_head`` + ``LogitsProcessor`` for optional MagiCompiler compilation."""
+    stack = _Qwen2OmniTalkerLogitsStack(lm_head, logits_processor)
+    _warn_if_magi_requested_but_unavailable()
+    if not is_magi_compiler_enabled():
+        return stack
+    if not _HAS_MAGI_COMPILER:
+        return stack
+
+    try:
+        compiled_stack = _magi_compile(
+            stack,
+            model_tag="qwen2_5_omni_talker_logits",
+            dynamic_arg_dims=_MAGI_TALKER_LOGITS_DYNAMIC_ARG_DIMS,
+        )
+        logger.info("[MagiCompiler] Compiled talker logits stack via magi_compile.")
+        return compiled_stack
+    except Exception as exc:
+        logger.warning(
+            "[MagiCompiler] Failed to compile talker logits stack, fallback to eager stack: %s",
             exc,
         )
         return stack

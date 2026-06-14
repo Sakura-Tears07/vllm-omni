@@ -3,7 +3,8 @@
 
 This is **(1)** the dedicated Magi sample entry: it enables ``VLLM_OMNI_MAGI_COMPILER``
 then delegates to ``end2end.py``. Model-side wiring is **(2)** talker
-``apply_magi_to_qwen2_decoder_layers`` and code2wav ``apply_magi_to_decoder_layers``;
+``apply_magi_to_qwen2_decoder_layers``, ``apply_magi_to_talker_logits_stack`` and
+code2wav ``apply_magi_to_decoder_layers``;
 **(3)** the implementation lives in ``vllm_omni/.../qwen2_5_omni_magi.py``.
 
 Prerequisites:

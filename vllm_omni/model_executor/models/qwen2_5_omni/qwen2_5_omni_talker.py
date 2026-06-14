@@ -183,7 +183,8 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         return logits
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        logits = self.language_model.compute_logits(hidden_states)
+        with _magi_add_nvtx_event("talker.compute_logits"):
+            logits = self.language_model.compute_logits(hidden_states)
         logits = self.bad_word_processor(logits)
         return logits
 
