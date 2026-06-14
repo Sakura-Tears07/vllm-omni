@@ -56,6 +56,11 @@ class OmniGPUWorkerBase(GPUWorker):
         vLLM's profile() only passes is_start, so we generate a descriptive
         trace filename here before delegating to the profiler.
         """
+        profiler_config = self.profiler_config
+        if profiler_config is not None and profiler_config.profiler == "cuda":
+            # CudaProfilerWrapper is created lazily inside GPUWorker.profile().
+            return GPUWorker.profile(self, is_start, profile_prefix)
+
         if self.profiler is None:
             raise RuntimeError(
                 "Profiling is not enabled. For diffusion models, set --profiler-config via CLI. "

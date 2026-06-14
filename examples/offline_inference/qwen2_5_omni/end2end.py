@@ -5,6 +5,7 @@ This example shows how to use vLLM-Omni for running offline inference
 with the correct prompt format on Qwen2.5-Omni
 """
 
+import json
 import os
 import time
 from typing import NamedTuple
@@ -288,9 +289,9 @@ query_map = {
 }
 
 
-def main(args):
-    model_name = "Qwen/Qwen2.5-Omni-7B"
-
+def main(args, *, cli_parser: FlexibleArgumentParser | None = None):
+    # Default matches HF id; override with VLLM_OMNI_MODEL for local checkpoints.
+    model_name = os.environ.get("VLLM_OMNI_MODEL", "Qwen/Qwen2.5-Omni-3B")
     # Get paths from args
     video_path = getattr(args, "video_path", None)
     image_path = getattr(args, "image_path", None)
@@ -300,7 +301,7 @@ def main(args):
 
     # Get the query function and call it with appropriate parameters
     query_func = query_map[args.query_type]
-    if args.query_type == "mixed_modalities":
+    if args.query_type == "use_mixed_modalities":
         query_result = query_func(
             video_path=video_path,
             image_path=image_path,
@@ -310,7 +311,7 @@ def main(args):
         )
     elif args.query_type == "use_audio_in_video":
         query_result = query_func(video_path=video_path, num_frames=num_frames, sampling_rate=sampling_rate)
-    elif args.query_type == "multi_audios":
+    elif args.query_type == "use_multi_audios":
         query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
     elif args.query_type == "use_image":
         query_result = query_func(image_path=image_path)
@@ -320,7 +321,7 @@ def main(args):
         query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
     else:
         query_result = query_func()
-    omni = Omni.from_cli_args(args, model=model_name)
+    omni = Omni.from_cli_args(args, parser=cli_parser, model=model_name)
     thinker_sampling_params = SamplingParams(
         temperature=0.0,  # Deterministic - no randomness
         top_p=1.0,  # Disable nucleus sampling
@@ -463,6 +464,21 @@ def parse_args():
         help="Threshold for using shared memory in bytes (default: 65536)",
     )
     parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help=(
+            "Path to multi-stage deploy YAML (e.g. vllm_omni/deploy/qwen2_5_omni_colocate_24gb.yaml). "
+            "Use this on ~24GB GPUs when stage 0 (thinker) and stage 2 (code2wav) share cuda:0."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Directory for saved text (.txt) and audio (.wav). Defaults to --output-wav value.",
+    )
+    parser.add_argument(
         "--output-wav",
         default="output_audio",
         help="[Deprecated] Output wav directory (use --output-dir).",
@@ -533,9 +549,21 @@ def parse_args():
         default=False,
         help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--code2wav-compilation-config",
+        dest="stage_2_compilation_config",
+        type=json.loads,
+        default=None,
+        help=(
+            "JSON object for stage 2 (code2wav) engine ``compilation_config`` "
+            "(merged into that stage only). When ``VLLM_OMNI_MAGI_COMPILER=1``, "
+            "vLLM compile is auto-disabled on code2wav so ``apply_magi_to_decoder_layers`` "
+            "(MagiCompiler) can own the DiT stack."
+        ),
+    )
+    return parser.parse_args(), parser
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    main(args)
+    args, cli_parser = parse_args()
+    main(args, cli_parser=cli_parser)
