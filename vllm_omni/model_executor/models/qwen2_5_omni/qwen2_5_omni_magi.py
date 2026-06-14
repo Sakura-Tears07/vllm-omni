@@ -178,23 +178,37 @@ _MAGI_DYNAMIC_ARG_DIMS: dict[str, int | list[int]] = {
 
 
 class _Qwen2OmniTalkerDecoderStack(nn.Module):
-    """Runs Qwen2 decoder layers for talker; compiled via ``magi_compile`` when enabled."""
+    """Runs Qwen2 decoder layers for talker; compiled via ``magi_compile`` when enabled.
 
-    def __init__(self, layers: nn.ModuleList, start_layer: int, end_layer: int):
+    When ``norm`` is set (last pipeline-parallel rank), final ``RMSNorm`` runs inside
+    this stack so Magi can fuse it with the decoder loop under the same ``model_tag``.
+    """
+
+    def __init__(
+        self,
+        layers: nn.ModuleList,
+        start_layer: int,
+        end_layer: int,
+        norm: nn.Module | None = None,
+    ):
         super().__init__()
         # Shares the same layer list as ``Qwen2Model.layers``.
         self.layers = layers
         self.start_layer = start_layer
         self.end_layer = end_layer
+        self.norm = norm
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         for layer in self.layers[self.start_layer : self.end_layer]:
             hidden_states, residual = layer(positions, hidden_states, residual)
+        if self.norm is not None:
+            hidden_states, _ = self.norm(hidden_states, residual)
+            return hidden_states, None
         return hidden_states, residual
 
 
@@ -229,9 +243,10 @@ def apply_magi_to_qwen2_decoder_layers(
     layers: nn.ModuleList,
     start_layer: int,
     end_layer: int,
+    norm: nn.Module | None = None,
 ) -> nn.Module:
     """Wrap talker Qwen2 decoder layers for optional MagiCompiler compilation."""
-    stack = _Qwen2OmniTalkerDecoderStack(layers, start_layer, end_layer)
+    stack = _Qwen2OmniTalkerDecoderStack(layers, start_layer, end_layer, norm=norm)
     _warn_if_magi_requested_but_unavailable()
     if not is_magi_compiler_enabled():
         return stack

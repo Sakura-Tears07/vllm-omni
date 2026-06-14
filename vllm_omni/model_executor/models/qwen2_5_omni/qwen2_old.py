@@ -291,18 +291,6 @@ class Qwen2Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
-        self._decoder_stack = apply_magi_to_qwen2_decoder_layers(
-            self.layers,
-            self.start_layer,
-            self.end_layer,
-        )
-        if is_magi_compiler_enabled():
-            logger.info(
-                "VLLM_OMNI_MAGI_COMPILER is set: talker Qwen2 uses "
-                "apply_magi_to_qwen2_decoder_layers and apply_magi_to_talker_logits_stack "
-                "(install magi_compiler for acceleration)."
-            )
-
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -310,6 +298,21 @@ class Qwen2Model(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+
+        norm_for_stack = self.norm if get_pp_group().is_last_rank else None
+        self._decoder_stack_includes_norm = get_pp_group().is_last_rank
+        self._decoder_stack = apply_magi_to_qwen2_decoder_layers(
+            self.layers,
+            self.start_layer,
+            self.end_layer,
+            norm=norm_for_stack,
+        )
+        if is_magi_compiler_enabled():
+            logger.info(
+                "VLLM_OMNI_MAGI_COMPILER is set: talker Qwen2 uses "
+                "apply_magi_to_qwen2_decoder_layers and apply_magi_to_talker_logits_stack "
+                "(install magi_compiler for acceleration)."
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -334,7 +337,8 @@ class Qwen2Model(nn.Module):
         hidden_states, residual = self._decoder_stack(positions, hidden_states, residual)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if not self._decoder_stack_includes_norm:
+            hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
