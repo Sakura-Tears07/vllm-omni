@@ -31,6 +31,11 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_magi import (
+    apply_magi_to_qwen2_decoder_layers,
+    is_magi_compiler_enabled,
+)
+
 logger = init_logger(__name__)
 
 
@@ -285,6 +290,16 @@ class Qwen2Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        self._decoder_stack = apply_magi_to_qwen2_decoder_layers(
+            self.layers,
+            self.start_layer,
+            self.end_layer,
+        )
+        if is_magi_compiler_enabled():
+            logger.info(
+                "VLLM_OMNI_MAGI_COMPILER is set: talker Qwen2 uses "
+                "apply_magi_to_qwen2_decoder_layers (install magi_compiler for acceleration)."
+            )
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
@@ -314,12 +329,7 @@ class Qwen2Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        for layer in self.layers[self.start_layer : self.end_layer]:
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                residual,
-            )
+        hidden_states, residual = self._decoder_stack(positions, hidden_states, residual)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
         hidden_states, _ = self.norm(hidden_states, residual)

@@ -26,13 +26,14 @@ python end2end.py --output-wav output_audio \
                   --query-type use_mixed_modalities
 ```
 
-### MagiCompiler (optional, code2wav DiT)
+### MagiCompiler (optional, talker + code2wav DiT)
 
 ```bash
 python magi_example.py --query-type text
 ```
 
 Same CLI flags as `end2end.py`; sets `VLLM_OMNI_MAGI_COMPILER=1` before delegating.
+Compiles Stage1 talker Qwen2 decoder layers and Stage2 Token2Wav DiT transformer stack.
 
 ### Modality control
 

@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Optional MagiCompiler integration for Qwen2.5-Omni Token2Wav DiT.
+"""Optional MagiCompiler integration for Qwen2.5-Omni talker and Token2Wav DiT.
 
 Integration surface (intended usage):
 
 1. **Example entrypoint**: ``examples/offline_inference/qwen2_5_omni/magi_example.py``
-2. **Model wiring**: ``apply_magi_to_decoder_layers(transformer_blocks)`` from
-   ``qwen2_5_omni_token2wav`` (single call site on the DiT model).
-3. **Definition**: :func:`apply_magi_to_decoder_layers` and the stack module
-   class in this module.
+2. **Model wiring**:
+   - Stage1 talker: ``apply_magi_to_qwen2_decoder_layers`` from ``qwen2_old.Qwen2Model``
+   - Stage2 code2wav: ``apply_magi_to_decoder_layers`` from ``qwen2_5_omni_token2wav``
+3. **Definition**: stack modules and apply helpers in this module.
 
 Set ``VLLM_OMNI_MAGI_COMPILER=1`` and install `MagiCompiler` (SandAI-org/MagiCompiler).
 If it is not installed, ``magi_compile`` is a no-op (same pattern as ``magi_human_dit``).
 
 Engine startup still calls :func:`merge_vllm_compilation_config_for_magi` from
-``stage_init_utils`` so vLLM's compile stack stays off on the code2wav stage when Magi
+``stage_init_utils`` so vLLM's compile stack stays off on talker/code2wav when Magi
 is enabled (implementation detail, not part of the three-part API above).
 """
 
@@ -68,9 +68,9 @@ def _warn_if_magi_requested_but_unavailable() -> None:
 
 
 # Align with LightX2V-MagiCompiler practice: use MagiCompiler as the single
-# torch.compile / Inductor path; disable vLLM's own compilation stack on the
-# code2wav stage to avoid double-compilation and conflicting graph passes.
-_MAGI_CODE2WAV_VLLM_COMPILATION_OVERRIDES: dict[str, Any] = {
+# torch.compile / Inductor path; disable vLLM's own compilation stack on Magi
+# stages to avoid double-compilation and conflicting graph passes.
+_MAGI_VLLM_COMPILATION_OVERRIDES: dict[str, Any] = {
     # vllm.config.compilation.CompilationMode.NONE
     "mode": 0,
     "pass_config": {
@@ -98,12 +98,15 @@ def _compilation_config_to_dict(raw: Any) -> dict[str, Any]:
     raise TypeError(f"Unsupported compilation_config type: {type(raw)!r}")
 
 
+_MAGI_ENABLED_STAGES = frozenset({"talker", "code2wav"})
+
+
 def merge_vllm_compilation_config_for_magi(engine_args_dict: dict[str, Any]) -> None:
-    """When MagiCompiler is enabled for Qwen2.5-Omni code2wav, turn off vLLM compilation.
+    """When MagiCompiler is enabled for Qwen2.5-Omni talker/code2wav, turn off vLLM compilation.
 
     vLLM's ``VLLM_COMPILE`` mode and fusion passes can fight with ``@magi_compile``
     (nested Dynamo / Inductor).  This forces ``CompilationMode.NONE`` and disables
-    the main custom fusion flags for the Token2Wav stage only.
+    the main custom fusion flags for the talker and Token2Wav stages.
     """
     if not is_magi_compiler_enabled():
         return
@@ -112,22 +115,24 @@ def merge_vllm_compilation_config_for_magi(engine_args_dict: dict[str, Any]) -> 
     # explicit non-Qwen2.5 architecture is present.
     if model_arch is not None and model_arch != "Qwen2_5OmniForConditionalGeneration":
         return
-    if engine_args_dict.get("model_stage") != "code2wav":
+    model_stage = engine_args_dict.get("model_stage")
+    if model_stage not in _MAGI_ENABLED_STAGES:
         return
 
     merged = _compilation_config_to_dict(engine_args_dict.get("compilation_config"))
-    magi_pc = copy.deepcopy(_MAGI_CODE2WAV_VLLM_COMPILATION_OVERRIDES["pass_config"])
+    magi_pc = copy.deepcopy(_MAGI_VLLM_COMPILATION_OVERRIDES["pass_config"])
     user_pc = merged.get("pass_config")
     if isinstance(user_pc, dict):
         # Mandatory disables win over user-enabled fusions for Magi compatibility.
         merged["pass_config"] = {**user_pc, **magi_pc}
     else:
         merged["pass_config"] = magi_pc
-    merged["mode"] = _MAGI_CODE2WAV_VLLM_COMPILATION_OVERRIDES["mode"]
+    merged["mode"] = _MAGI_VLLM_COMPILATION_OVERRIDES["mode"]
     engine_args_dict["compilation_config"] = merged
     logger.info(
-        "[MagiCompiler] Disabled vLLM torch.compile stack for code2wav "
-        "(mode=NONE, fusion passes off for norm/act/attn quant)."
+        "[MagiCompiler] Disabled vLLM torch.compile stack for %s "
+        "(mode=NONE, fusion passes off for norm/act/attn quant).",
+        model_stage,
     )
 
 
@@ -169,6 +174,65 @@ _MAGI_DYNAMIC_ARG_DIMS: dict[str, int | list[int]] = {
     # ``mark_dynamic`` on dim 0 then fails with ConstraintViolationError.
     "block_diff": [2, 3],
 }
+
+
+class _Qwen2OmniTalkerDecoderStack(nn.Module):
+    """Runs Qwen2 decoder layers for talker; compiled via ``magi_compile`` when enabled."""
+
+    def __init__(self, layers: nn.ModuleList, start_layer: int, end_layer: int):
+        super().__init__()
+        # Shares the same layer list as ``Qwen2Model.layers``.
+        self.layers = layers
+        self.start_layer = start_layer
+        self.end_layer = end_layer
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        for layer in self.layers[self.start_layer : self.end_layer]:
+            hidden_states, residual = layer(positions, hidden_states, residual)
+        return hidden_states, residual
+
+
+_MAGI_TALKER_DYNAMIC_ARG_DIMS: dict[str, int | list[int]] = {
+    # Flattened token layout [num_tokens, hidden] — num_tokens varies per batch.
+    "hidden_states": 0,
+    "residual": 0,
+    # positions is (seq_len,) or (3, seq_len) for MRoPE.
+    "positions": -1,
+}
+
+
+def apply_magi_to_qwen2_decoder_layers(
+    layers: nn.ModuleList,
+    start_layer: int,
+    end_layer: int,
+) -> nn.Module:
+    """Wrap talker Qwen2 decoder layers for optional MagiCompiler compilation."""
+    stack = _Qwen2OmniTalkerDecoderStack(layers, start_layer, end_layer)
+    _warn_if_magi_requested_but_unavailable()
+    if not is_magi_compiler_enabled():
+        return stack
+    if not _HAS_MAGI_COMPILER:
+        return stack
+
+    try:
+        compiled_stack = _magi_compile(
+            stack,
+            model_tag="qwen2_5_omni_talker",
+            dynamic_arg_dims=_MAGI_TALKER_DYNAMIC_ARG_DIMS,
+        )
+        logger.info("[MagiCompiler] Compiled talker Qwen2 decoder stack via magi_compile.")
+        return compiled_stack
+    except Exception as exc:
+        logger.warning(
+            "[MagiCompiler] Failed to compile talker decoder stack, fallback to eager stack: %s",
+            exc,
+        )
+        return stack
 
 
 def apply_magi_to_decoder_layers(blocks: nn.ModuleList) -> nn.Module:

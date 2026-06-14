@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Example entrypoint for Qwen2.5-Omni offline inference with MagiCompiler on code2wav DiT.
+"""Example entrypoint for Qwen2.5-Omni offline inference with MagiCompiler.
 
 This is **(1)** the dedicated Magi sample entry: it enables ``VLLM_OMNI_MAGI_COMPILER``
-then delegates to ``end2end.py``. Model-side wiring is **(2)** a single call to
-``apply_magi_to_decoder_layers`` inside ``qwen2_5_omni_token2wav``; **(3)** the
-implementation lives in ``vllm_omni/.../qwen2_5_omni_magi.py``.
+then delegates to ``end2end.py``. Model-side wiring is **(2)** talker
+``apply_magi_to_qwen2_decoder_layers`` and code2wav ``apply_magi_to_decoder_layers``;
+**(3)** the implementation lives in ``vllm_omni/.../qwen2_5_omni_magi.py``.
 
 Prerequisites:
 
