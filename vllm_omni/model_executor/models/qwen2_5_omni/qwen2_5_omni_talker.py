@@ -32,6 +32,19 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerMultiModalProcessor,
 )
 
+try:
+    from magi_compiler.utils.nvtx import add_nvtx_event as _magi_add_nvtx_event
+except Exception:
+    class _magi_add_nvtx_event:  # type: ignore[no-redef]
+        def __init__(self, event_name: str):
+            self.event_name = event_name
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *excinfo):
+            return False
+
 
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen2_5OmniThinkerMultiModalProcessor,
@@ -142,9 +155,10 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         # projection
         inputs_embeds = self.thinker_to_talker_proj(inputs_embeds)
 
-        hidden_states = self.language_model.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds
-        )
+        with _magi_add_nvtx_event("talker.model.forward"):
+            hidden_states = self.language_model.model(
+                input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds
+            )
         return hidden_states
 
     def bad_word_processor(self, logits: torch.Tensor) -> torch.Tensor:
@@ -169,7 +183,8 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         return logits
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        logits = self.language_model.compute_logits(hidden_states)
+        with _magi_add_nvtx_event("talker.compute_logits"):
+            logits = self.language_model.compute_logits(hidden_states)
         logits = self.bad_word_processor(logits)
         return logits
 

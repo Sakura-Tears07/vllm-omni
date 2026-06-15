@@ -31,6 +31,12 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_magi import (
+    apply_magi_to_qwen2_decoder_layers,
+    apply_magi_to_talker_logits_stack,
+    is_magi_compiler_enabled,
+)
+
 logger = init_logger(__name__)
 
 
@@ -285,7 +291,6 @@ class Qwen2Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
-
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -293,6 +298,21 @@ class Qwen2Model(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+
+        norm_for_stack = self.norm if get_pp_group().is_last_rank else None
+        self._decoder_stack_includes_norm = get_pp_group().is_last_rank
+        self._decoder_stack = apply_magi_to_qwen2_decoder_layers(
+            self.layers,
+            self.start_layer,
+            self.end_layer,
+            norm=norm_for_stack,
+        )
+        if is_magi_compiler_enabled():
+            logger.info(
+                "VLLM_OMNI_MAGI_COMPILER is set: talker Qwen2 uses "
+                "apply_magi_to_qwen2_decoder_layers and apply_magi_to_talker_logits_stack "
+                "(install magi_compiler for acceleration)."
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -314,15 +334,11 @@ class Qwen2Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        for layer in self.layers[self.start_layer : self.end_layer]:
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                residual,
-            )
+        hidden_states, residual = self._decoder_stack(positions, hidden_states, residual)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if not self._decoder_stack_includes_norm:
+            hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -417,6 +433,13 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = Sampler()
+        if get_pp_group().is_last_rank:
+            self._talker_logits_stack = apply_magi_to_talker_logits_stack(
+                self.lm_head,
+                self.logits_processor,
+            )
+        else:
+            self._talker_logits_stack = None
 
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
@@ -437,8 +460,12 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        return logits
+        # MagiCompiler cannot mark dim 0 dynamic when batch/token count is 0 or 1
+        # (Dynamo zero/one specialization). vLLM profile_run with max_num_seqs=1
+        # passes [1, hidden] here; keep that path eager and compile only when >= 2.
+        if self._talker_logits_stack is not None and hidden_states.shape[0] > 1:
+            return self._talker_logits_stack(hidden_states)
+        return self.logits_processor(self.lm_head, hidden_states)
 
     def sample(
         self,

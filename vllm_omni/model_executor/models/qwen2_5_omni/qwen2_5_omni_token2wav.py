@@ -35,7 +35,24 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.qwen2_5_omni.audio_length import cap_and_align_mel_length, resolve_max_mel_frames
+from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_magi import (
+    apply_magi_to_decoder_layers,
+    is_magi_compiler_enabled,
+)
 from vllm_omni.platforms import current_omni_platform
+
+try:
+    from magi_compiler.utils.nvtx import add_nvtx_event as _magi_add_nvtx_event
+except Exception:
+    class _magi_add_nvtx_event:  # type: ignore[no-redef]
+        def __init__(self, event_name: str):
+            self.event_name = event_name
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *excinfo):
+            return False
 
 
 # Provide a no-op auto_docstring decorator to satisfy annotations if missing
@@ -574,17 +591,26 @@ class DiTAttention(nn.Module):
         # Due to training process, only first head is applied with RoPE,
         # will be fixed at next release
         cos, sin = position_embeddings
-        query[:, :1], key[:, :1] = apply_rotary_pos_emb(query[:, :1], key[:, :1], cos, sin)
+        # Avoid in-place slice assignment here: it is prone to Dynamo graph
+        # breaks and weakens compiler fusion opportunities.
+        first_q, first_k = apply_rotary_pos_emb(query[:, :1], key[:, :1], cos, sin)
+        if self.heads > 1:
+            query = torch.cat((first_q, query[:, 1:]), dim=1)
+            key = torch.cat((first_k, key[:, 1:]), dim=1)
+        else:
+            query = first_q
+            key = first_k
 
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-        attention_weights, _ = attention_interface(
-            self,
-            query,
-            key,
-            value,
-            attention_mask=attention_mask,
-            is_causal=False,
-        )
+        with _magi_add_nvtx_event("token2wav.dit.attention"):
+            attention_weights, _ = attention_interface(
+                self,
+                query,
+                key,
+                value,
+                attention_mask=attention_mask,
+                is_causal=False,
+            )
 
         # mask. e.g. inference got a batch with different target durations,
         # mask out the padding
@@ -1066,21 +1092,22 @@ class Qwen2_5OmniToken2WavBigVGANModel(Qwen2_5OmniPreTrainedModel):
         return self.normalize_spectrogram(decibel_spectrum, 1, -115)
 
     def forward(self, mel_spectrogram):
-        processed_spectrogram = self.process_mel_spectrogram(mel_spectrogram)
-        hidden_representation = self.conv_pre(processed_spectrogram)
+        with _magi_add_nvtx_event("token2wav.bigvgan.forward"):
+            processed_spectrogram = self.process_mel_spectrogram(mel_spectrogram)
+            hidden_representation = self.conv_pre(processed_spectrogram)
 
-        for layer_index in range(self.num_upsample_layers):
-            hidden_representation = self.ups[layer_index][0](hidden_representation)
-            residual_output = sum(
-                self.resblocks[layer_index * self.num_residual_blocks + block_index](hidden_representation)
-                for block_index in range(self.num_residual_blocks)
-            )
-            residual_output = residual_output / self.num_residual_blocks
-            hidden_representation = residual_output
+            for layer_index in range(self.num_upsample_layers):
+                hidden_representation = self.ups[layer_index][0](hidden_representation)
+                residual_output = sum(
+                    self.resblocks[layer_index * self.num_residual_blocks + block_index](hidden_representation)
+                    for block_index in range(self.num_residual_blocks)
+                )
+                residual_output = residual_output / self.num_residual_blocks
+                hidden_representation = residual_output
 
-        hidden_representation = self.activation_post(hidden_representation)
-        output_waveform = self.conv_post(hidden_representation)
-        return torch.clamp(output_waveform, min=-1.0, max=1.0).squeeze().cpu()
+            hidden_representation = self.activation_post(hidden_representation)
+            output_waveform = self.conv_post(hidden_representation)
+            return torch.clamp(output_waveform, min=-1.0, max=1.0).squeeze().cpu()
 
 
 class RungeKutta4ODESolver:
@@ -1200,6 +1227,12 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
                     look_backward_block=1 if i in config.look_backward_layers else 0,
                 )
             )
+        self._dit_transformer_stack = apply_magi_to_decoder_layers(self.transformer_blocks)
+        if is_magi_compiler_enabled():
+            logger.info(
+                "VLLM_OMNI_MAGI_COMPILER is set: Token2Wav DiT uses "
+                "apply_magi_to_decoder_layers (install magi_compiler for acceleration)."
+            )
 
         self.norm_out = Qwen2_5_OmniAdaLayerNormZero_Final(config.hidden_size)  # final modulation
         self.proj_out = nn.Linear(config.hidden_size, config.mel_dim)
@@ -1229,38 +1262,42 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         if time_step.ndim == 0:
             time_step = time_step.repeat(batch_size)
 
-        # Compute embeddings
-        time_embedding = self.time_embed(time_step)
-        text_embedding = self.text_embed(quantized_code, drop_code=False if apply_cfg else drop_code)
-        text_embedding_unconditioned = self.text_embed(quantized_code, drop_code=True) if apply_cfg else None
+        with _magi_add_nvtx_event("token2wav.dit.forward"):
+            with _magi_add_nvtx_event("token2wav.dit.embed"):
+                time_embedding = self.time_embed(time_step)
+                text_embedding = self.text_embed(quantized_code, drop_code=False if apply_cfg else drop_code)
+                text_embedding_unconditioned = (
+                    self.text_embed(quantized_code, drop_code=True) if apply_cfg else None
+                )
 
-        hidden_states = self.input_embed(
-            hidden_states,
-            speaker_embedding,
-            condition_vector,
-            text_embedding,
-            drop_audio_cond=drop_audio_conditioning,
-            code_embed_uncond=text_embedding_unconditioned,
-            apply_cfg=apply_cfg,
-        )
+                hidden_states = self.input_embed(
+                    hidden_states,
+                    speaker_embedding,
+                    condition_vector,
+                    text_embedding,
+                    drop_audio_cond=drop_audio_conditioning,
+                    code_embed_uncond=text_embedding_unconditioned,
+                    apply_cfg=apply_cfg,
+                )
 
-        # Compute positional encodings
-        position_embeddings = self.rotary_embed(hidden_states)
-        blockwise_difference = self._create_block_diff(hidden_states)
+                position_embeddings = self.rotary_embed(hidden_states)
+                blockwise_difference = self._create_block_diff(hidden_states)
 
-        # Transformer blocks
-        for transformer_block in self.transformer_blocks:
-            hidden_states = transformer_block(
-                hidden_states,
-                time_embedding,
-                position_embeddings=position_embeddings,
-                block_diff=blockwise_difference,
-            )
+            cos, sin = position_embeddings
+            with _magi_add_nvtx_event("token2wav.dit.stack"):
+                hidden_states = self._dit_transformer_stack(
+                    hidden_states,
+                    time_embedding,
+                    cos,
+                    sin,
+                    blockwise_difference,
+                )
 
-        hidden_states = self.norm_out(hidden_states, time_embedding)
-        output = self.proj_out(hidden_states)
+            with _magi_add_nvtx_event("token2wav.dit.head"):
+                hidden_states = self.norm_out(hidden_states, time_embedding)
+                output = self.proj_out(hidden_states)
 
-        return output
+            return output
 
     def sample(
         self,
@@ -1330,7 +1367,8 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
             time_embedding += sway_coefficient * (torch.cos(torch.pi / 2 * time_embedding) - 1 + time_embedding)
 
         ode_solver = RungeKutta4ODESolver(function=ode_function, initial_value=initial_state)
-        solution_trajectory = ode_solver.integrate(time_embedding)
+        with _magi_add_nvtx_event("token2wav.dit.sample"):
+            solution_trajectory = ode_solver.integrate(time_embedding)
 
         generated_waveform = solution_trajectory[-1]
         generated_mel_spectrogram = generated_waveform.permute(0, 2, 1)
@@ -1401,7 +1439,8 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
             time_embedding += sway_coefficient * (torch.cos(torch.pi / 2 * time_embedding) - 1 + time_embedding)
 
         ode_solver = RungeKutta4ODESolver(function=ode_function, initial_value=initial_state)
-        solution_trajectory = ode_solver.integrate(time_embedding)
+        with _magi_add_nvtx_event("token2wav.dit.sample"):
+            solution_trajectory = ode_solver.integrate(time_embedding)
 
         generated_waveform = solution_trajectory[-1]
         generated_mel_spectrogram = generated_waveform.permute(0, 2, 1)
@@ -1514,20 +1553,20 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
         **kwargs,
     ):
         """Generates a waveform from input code and conditioning parameters."""
+        with _magi_add_nvtx_event("token2wav.model.forward"):
+            mel_spectrogram = self.code2wav_dit_model.sample(
+                conditioning,
+                reference_mel,
+                code,
+                num_steps=num_steps,
+                guidance_scale=guidance_scale,
+                sway_coefficient=sway_coefficient,
+                max_mel_frames=max_mel_frames,
+            ).to(self.code2wav_bigvgan_model.dtype)
 
-        mel_spectrogram = self.code2wav_dit_model.sample(
-            conditioning,
-            reference_mel,
-            code,
-            num_steps=num_steps,
-            guidance_scale=guidance_scale,
-            sway_coefficient=sway_coefficient,
-            max_mel_frames=max_mel_frames,
-        ).to(self.code2wav_bigvgan_model.dtype)
+            waveform = self.code2wav_bigvgan_model(mel_spectrogram).to(self.dtype)
 
-        waveform = self.code2wav_bigvgan_model(mel_spectrogram).to(self.dtype)
-
-        return waveform
+            return waveform
 
     # ============== Chunked processing helpers (compat with qwen2_code2wav_dit) ==============  # noqa: E501
     @torch.inference_mode()

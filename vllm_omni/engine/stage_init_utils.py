@@ -27,6 +27,9 @@ from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
+from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_magi import (
+    merge_vllm_compilation_config_for_magi,
+)
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -409,6 +412,8 @@ def build_engine_args_dict(
 
     if stage_type != "diffusion":
         resolve_worker_cls(engine_args_dict)
+
+    merge_vllm_compilation_config_for_magi(engine_args_dict)
 
     return engine_args_dict
 

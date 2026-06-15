@@ -1,0 +1,85 @@
+# Qwen2.5-Omni: tighter VRAM on cuda:0 when stage 0 (thinker) and stage 2 (code2wav)
+# share one ~24GB consumer GPU (stage 1 talker stays on cuda:1 — needs 2 GPUs).
+#
+# Default ``qwen2_5_omni.yaml`` targets 2× large datacenter cards; thinker often
+# grabs most of cuda:0 so code2wav DiT attention spikes can OOM. This file
+# lowers stage-0 ``gpu_memory_utilization`` so more physical memory stays free
+# for the second EngineCore on the same device.
+#
+# Example (from repo root):
+#   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#   python examples/offline_inference/qwen2_5_omni/end2end.py ... \\
+#     --deploy-config vllm_omni/deploy/qwen2_5_omni_colocate_24gb.yaml
+#
+# Single-GPU hosts need a different layout (move talker onto cuda:0 and shrink
+# all stages further); not covered here.
+
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.55
+    enforce_eager: true
+    mm_processor_cache_gb: 0
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.8
+    enforce_eager: true
+    devices: "1"
+    default_sampling_params:
+      temperature: 0.9
+      top_p: 0.8
+      top_k: 40
+      max_tokens: 2048
+      seed: 42
+      repetition_penalty: 1.05
+
+  - stage_id: 2
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.2
+    enforce_eager: true
+    enable_flashinfer_autotune: false
+    async_scheduling: false
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      repetition_penalty: 1.1
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        enforce_eager: false
+      - stage_id: 2
+        devices: "2"
+
+  rocm:
+    stages:
+      - stage_id: 2
+        devices: "2"
+
+  xpu:
+    stages:
+      - stage_id: 0
+        gpu_memory_utilization: 0.9
+        enforce_eager: false
+      - stage_id: 1
+        gpu_memory_utilization: 0.5
+        enforce_eager: false
+      - stage_id: 2
+        gpu_memory_utilization: 0.3
+        devices: "1"
