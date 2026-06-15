@@ -67,6 +67,12 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.quantization.component_config import (
     resolve_encoder_quant_config,
 )
+from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_magi import (
+    is_magi_compiler_enabled,
+    wire_magi_into_qwen2_logits,
+    wire_magi_into_qwen2_model,
+    wire_magi_into_qwen2_vision,
+)
 
 try:
     import flash_attn
@@ -392,6 +398,25 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 prefix=maybe_prefix(prefix, "language_model"),
                 hf_config=thinker_config.text_config,
                 architectures=["Qwen2ForCausalLM"],
+            )
+
+        if self.visual is not None:
+            wire_magi_into_qwen2_vision(self.visual)
+
+        wire_magi_into_qwen2_model(
+            self.language_model.model,
+            model_tag="qwen2_5_omni_thinker",
+        )
+        wire_magi_into_qwen2_logits(
+            self.language_model,
+            model_tag="qwen2_5_omni_thinker_logits",
+        )
+        if is_magi_compiler_enabled():
+            logger.info(
+                "VLLM_OMNI_MAGI_COMPILER is set: thinker Qwen2 uses "
+                "wire_magi_into_qwen2_model, wire_magi_into_qwen2_logits, "
+                "and wire_magi_into_qwen2_vision "
+                "(install magi_compiler for acceleration)."
             )
 
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
